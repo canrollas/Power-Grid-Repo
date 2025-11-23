@@ -1,0 +1,13 @@
+pandas
+numpy
+matplotlib
+scikit-learn
+lightgbm
+tensorflow
+tensorflow-metal
+seaborn
+statsmodels
+tqdm
+rich
+optuna
+
