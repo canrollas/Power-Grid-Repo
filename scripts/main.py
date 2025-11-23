@@ -13,6 +13,10 @@ import sys
 import os
 import pandas as pd
 import numpy as np
+import matplotlib
+# Set matplotlib backend to Agg (non-interactive) - works without tkinter
+# We save plots to files, so interactive display is not required
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import random
 from rich.console import Console
@@ -24,6 +28,9 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from client_categorization import analyze_client_categories
 from lstm_training import run_lstm_training
+from experiment_tracker import ExperimentTracker
+from error_handler import ErrorHandler
+from report_generator import ReportGenerator
 
 def load_consumption_data(data_path="data/raw/LD2011_2014.txt", console=None):
     """
@@ -116,25 +123,30 @@ def trim_leading_zeros(data, threshold=0.01):
     # Return data from first active index onwards
     return data[first_active_idx:]
 
-def apply_auto_trimming(df, console=None, min_length=500):
+def apply_auto_trimming(df, console=None, min_length=500, threshold=0.01):
     """
-    Applies auto-trimming to remove leading zeros from all client columns.
+    Applies client-based trimming: Her client için ilk anlamlı değerden itibaren 
+    başlayan ayrı seriler oluşturur. Zaman eksenini fiziksel olarak kısaltır.
     
     Args:
         df: DataFrame with datetime index and client columns
         console: Rich Console object for colored output
         min_length: Minimum length after trimming to keep the client (default: 500)
+        threshold: Minimum value to consider as active (default: 0.01)
     
     Returns:
-        Trimmed DataFrame with same structure
+        dict[str, pd.Series]: Her client için trimmed seri (farklı uzunlukta zaman index'i)
+        dict: Trimming bilgileri
+        list: Atılan client'lar
     """
     if console is None:
         console = Console()
     
-    console.print("\n[bold]4. Applying Auto-Trimming (Cold Start Problem Fix):[/bold]")
+    console.print("\n[bold]4. Applying Client-Based Trimming (Cold Start Problem Fix):[/bold]")
+    console.print(f"   [dim]Her client için ilk anlamlı değerden itibaren seri oluşturuluyor...[/dim]")
     console.print(f"   [dim]Processing {len(df.columns)} clients...[/dim]")
     
-    trimmed_df = df.copy()
+    trimmed_series = {}  # dict[str, pd.Series] - her client'ın kendi zaman serisi
     skipped_clients = []
     trimmed_info = {}
     
@@ -149,42 +161,60 @@ def apply_auto_trimming(df, console=None, min_length=500):
         task = progress.add_task("[cyan]Trimming clients...", total=len(df.columns))
         
         for col in df.columns:
-            raw_data = df[col].values
+            client_series = df[col]  # pandas Series with datetime index
             
-            # Find first active index
-            clean_data = trim_leading_zeros(raw_data)
+            # İlk anlamlı değerin index'ini bul
+            active_mask = client_series > threshold
+            active_indices = client_series.index[active_mask]
             
-            if clean_data is None or len(clean_data) < min_length:
-                # Skip this client - data too short after trimming
-                trimmed_df = trimmed_df.drop(columns=[col])
+            if len(active_indices) == 0:
+                # Hiç anlamlı değer yok, client'ı at
                 skipped_clients.append(col)
                 progress.update(task, advance=1)
                 continue
             
-            first_active_idx = len(raw_data) - len(clean_data)
-            trimmed_info[col] = {
-                'original_length': len(raw_data),
-                'trimmed_length': len(clean_data),
-                'trimmed_points': first_active_idx,
-                'first_active_date': df.index[first_active_idx]
-            }
+            # İlk ve son anlamlı değerlerin index'leri
+            t_start = active_indices[0]
+            t_end = active_indices[-1]
             
-            # Update the column with trimmed data (pad with NaN at the beginning)
-            trimmed_values = np.full(len(raw_data), np.nan)
-            trimmed_values[first_active_idx:] = clean_data
-            trimmed_df[col] = trimmed_values
+            # Client'ın trimmed serisini oluştur (fiziksel olarak kes)
+            s_trimmed = client_series.loc[t_start:t_end].dropna()
+            
+            if len(s_trimmed) < min_length:
+                # Çok kısa, client'ı at
+                skipped_clients.append(col)
+                progress.update(task, advance=1)
+                continue
+            
+            # Trimmed seriyi dict'e ekle
+            trimmed_series[col] = s_trimmed
+            
+            # Trimming bilgilerini kaydet
+            original_length = len(client_series)
+            trimmed_length = len(s_trimmed)
+            trimmed_points = original_length - trimmed_length
+            
+            trimmed_info[col] = {
+                'original_length': original_length,
+                'trimmed_length': trimmed_length,
+                'trimmed_points': trimmed_points,
+                'first_active_date': t_start,
+                'last_active_date': t_end
+            }
             
             progress.update(task, advance=1)
     
-    # Drop rows where all values are NaN (before any client started)
-    trimmed_df = trimmed_df.dropna(how='all')
-    
-    console.print(f"   [green]Successfully trimmed {len(trimmed_info)} clients[/green]")
+    console.print(f"   [green]Successfully trimmed {len(trimmed_series)} clients[/green]")
     if skipped_clients:
         console.print(f"   [yellow]Skipped {len(skipped_clients)} clients (too short after trimming)[/yellow]")
     console.print(f"   [dim]Total processed: {len(df.columns)} clients[/dim]")
     
-    return trimmed_df, trimmed_info, skipped_clients
+    # Toplam satır sayısını göster (artık her client farklı uzunlukta)
+    total_data_points = sum(len(s) for s in trimmed_series.values())
+    console.print(f"   [dim]Total data points (sum of all client series): {total_data_points:,}[/dim]")
+    console.print(f"   [dim]Average series length: {total_data_points / len(trimmed_series):.0f} points[/dim]")
+    
+    return trimmed_series, trimmed_info, skipped_clients
 
 def main():
     """
@@ -192,12 +222,21 @@ def main():
     """
     console = Console()
     
+    # Initialize experiment tracking and error handling
+    tracker = ExperimentTracker()
+    error_handler = ErrorHandler(tracker=tracker, console=console)
+    
+    console.print(f"\n[bold]Experiment:[/bold] [cyan]{tracker.experiment_name}[/cyan]")
+    console.print(f"[dim]Results will be saved to: {tracker.experiment_dir}[/dim]")
+    
     # Print header with panel
     title = Text("DATA READING - Grid Consumption Data", style="bold blue")
     console.print(Panel(title, border_style="blue", expand=False))
     
     data_path = "data/raw/LD2011_2014.txt"
     console.print(f"\n[bold]1. Loading data file:[/bold] [cyan]{data_path}[/cyan]")
+    
+    tracker.log_step("DATA_LOADING_START", f"Loading data from {data_path}")
 
     try:
         df = load_consumption_data(data_path, console)
@@ -224,6 +263,9 @@ def main():
         
         console.print(f"\n[bold]3. Plotting consumption for 3 random clients:[/bold] [cyan]{', '.join(map(str, random_clients))}[/cyan]")
 
+        # Create output directory for plots if it doesn't exist
+        os.makedirs("data/processed/plots", exist_ok=True)
+        
         plt.figure(figsize=(14, 6))
         for cid in random_clients:
             plt.plot(df.index, df[cid], label=f"Client {cid}", linewidth=1)
@@ -231,15 +273,22 @@ def main():
         plt.xlabel("Datetime")
         plt.ylabel("Consumption (kW)")
         plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.show()
+        
+        # Save plot
+        plot_path = "data/processed/plots/consumption_before_trimming.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        console.print(f"   [green]Plot saved to: {plot_path}[/green]")
+        tracker.add_plot('consumption_before_trimming', plot_path, 'Consumption before trimming')
+        plt.close()  # Close figure to free memory
         
         # Cold Start Problem Explanation and Auto-Trimming
         console.print("\n[bold]4. Cold Start Problem & Auto-Trimming:[/bold]")
         console.print("   [dim]Removing leading zeros to prevent model learning 'zero consumption is normal'[/dim]")
         
-        # Apply auto-trimming
-        trimmed_df, trimmed_info, skipped_clients = apply_auto_trimming(df, console)
+        # Apply auto-trimming (artık dict[str, pd.Series] döndürüyor)
+        trimmed_series, trimmed_info, skipped_clients = apply_auto_trimming(df, console)
         
         # Show trimming info for the 3 random clients (simplified)
         console.print("\n[bold]5. Trimming Summary:[/bold]")
@@ -248,25 +297,45 @@ def main():
             console.print(f"   [yellow]Skipped {len(skipped_clients)} clients (too short)[/yellow]")
         
         # Plot trimmed data for the same clients (if they still exist)
-        available_clients = [cid for cid in random_clients if cid in trimmed_df.columns]
+        available_clients = [cid for cid in random_clients if cid in trimmed_series]
         if available_clients:
             console.print(f"\n[bold]6. Plotting trimmed consumption data:[/bold] [cyan]{', '.join(map(str, available_clients))}[/cyan]")
             
             plt.figure(figsize=(14, 6))
             for cid in available_clients:
-                # Only plot non-NaN values
-                mask = ~trimmed_df[cid].isna()
-                if mask.sum() > 0:
-                    plt.plot(trimmed_df.index[mask], trimmed_df[cid][mask], 
-                            label=f"Client {cid} (trimmed)", linewidth=1)
+                # Her client'ın serisi zaten trimmed (cold start yok)
+                client_series = trimmed_series[cid]
+                plt.plot(client_series.index, client_series.values, 
+                        label=f"Client {cid} (trimmed)", linewidth=1)
             plt.title("Electricity Consumption - After Auto-Trimming (Cold Start Fixed)")
             plt.xlabel("Datetime")
             plt.ylabel("Consumption (kW)")
             plt.legend()
+            plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            plt.show()
+            
+            # Save plot
+            plot_path = "data/processed/plots/consumption_after_trimming.png"
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            console.print(f"   [green]Plot saved to: {plot_path}[/green]")
+            tracker.add_plot('consumption_after_trimming', plot_path, 'Consumption after trimming')
+            plt.close()  # Close figure to free memory
         
         # Client Categorization Analysis (After Trimming)
+        # Categorization için DataFrame'e ihtiyaç var, bu yüzden trimmed_series'den oluşturuyoruz
+        # NOT: Bu DataFrame sadece görselleştirme için, asıl işlemler trimmed_series ile yapılıyor
+        console.print("\n[bold]6.5. Creating DataFrame for categorization (visualization only)...[/bold]")
+        # Tüm client'ların birleşik zaman eksenini bul
+        all_timestamps = set()
+        for client_series in trimmed_series.values():
+            all_timestamps.update(client_series.index)
+        all_timestamps = sorted(all_timestamps)
+        
+        # DataFrame oluştur (NaN ile doldurulacak)
+        trimmed_df_for_viz = pd.DataFrame(index=all_timestamps, columns=list(trimmed_series.keys()))
+        for client_id, client_series in trimmed_series.items():
+            trimmed_df_for_viz.loc[client_series.index, client_id] = client_series.values
+        
         # 
         # IMPORTANT NOTE: Why do categorization results change after trimming?
         #
@@ -294,39 +363,96 @@ def main():
         #    "This client does not consume regularly, experiences constant interruptions."
         #
         console.print("\n" + "="*60)
-        stats_after, client_metrics_after = analyze_client_categories(trimmed_df, console, title_suffix="(After Trimming)")
+        stats_after, client_metrics_after = analyze_client_categories(trimmed_df_for_viz, console, title_suffix="(After Trimming)")
         console.print("="*60)
         
         # Update dataset info
         console.print("\n[bold]7. Updated Dataset Info (After Trimming):[/bold]")
-        console.print(f"   [dim]- Number of datetime entries (rows):[/dim] [green]{trimmed_df.shape[0]:,}[/green]")
-        console.print(f"   [dim]- Number of clients (columns):[/dim] [green]{trimmed_df.shape[1]}[/green]")
-        if trimmed_df.shape[0] > 0:
-            console.print(f"   [dim]- Time range:[/dim] [green]{trimmed_df.index.min()} - {trimmed_df.index.max()}[/green]")
+        total_data_points = sum(len(s) for s in trimmed_series.values())
+        avg_length = total_data_points / len(trimmed_series) if len(trimmed_series) > 0 else 0
+        console.print(f"   [dim]- Number of clients:[/dim] [green]{len(trimmed_series)}[/green]")
+        console.print(f"   [dim]- Total data points (sum of all client series):[/dim] [green]{total_data_points:,}[/green]")
+        console.print(f"   [dim]- Average series length:[/dim] [green]{avg_length:.0f} points[/green]")
+        if len(trimmed_series) > 0:
+            # Tüm client'ların zaman aralıklarını göster
+            all_starts = [s.index[0] for s in trimmed_series.values()]
+            all_ends = [s.index[-1] for s in trimmed_series.values()]
+            console.print(f"   [dim]- Earliest start:[/dim] [green]{min(all_starts)}[/green]")
+            console.print(f"   [dim]- Latest end:[/dim] [green]{max(all_ends)}[/green]")
         
-        # LSTM Training with Optuna
+        # Multi-Client LSTM Training
         console.print("\n" + "="*60)
-        lstm_results, failed_clients = run_lstm_training(
-            trimmed_df,
+        result, failed_clients = run_lstm_training(
+            trimmed_series,
             console=console,
+            tracker=tracker,
+            error_handler=error_handler,
             sequence_length=24,
             forecast_horizon=1,
-            n_trials=20,
-            max_clients=None  # Set to a number to limit clients for testing
+            embedding_dim=8,  # Reduced for speed
+            lstm_units=32,  # Reduced for speed
+            dropout_rate=0.2,
+            learning_rate=0.001,
+            num_layers=1,  # Reduced for speed
+            batch_size=512,  # Increased for speed (4x fewer steps)
+            epochs=20  # Reduced for speed
         )
         console.print("="*60)
         
-        console.print("\n[green][bold]Analysis completed successfully![/bold][/green]")
-        console.print("[dim]The dataset has been transformed to remove Cold Start problems.[/dim]")
+        if result:
+            lstm_results = result
+        else:
+            lstm_results = None
+        
+        # Finalize experiment and generate report
+        console.print("\n[bold]Generating Experiment Report...[/bold]")
+        summary = tracker.finalize()
+        
+        # Generate HTML report
+        report_generator = ReportGenerator(tracker)
+        report_path = report_generator.generate_report()
+        
+        console.print(f"\n[green][bold]Analysis completed successfully![/bold][/green]")
+        console.print(f"[dim]The dataset has been transformed to remove Cold Start problems.[/dim]")
+        console.print(f"\n[bold]Comprehensive Report Generated:[/bold]")
+        console.print(f"   [cyan]{report_path}[/cyan]")
+        console.print(f"\n[bold]Experiment Data:[/bold]")
+        console.print(f"   [cyan]{tracker.experiment_dir}[/cyan]")
+        console.print(f"\n[bold]Summary:[/bold]")
+        console.print(f"   • Total Clients: {summary.get('total_clients', 'N/A')}")
+        if lstm_results:
+            console.print(f"   • Model Metrics - MAE: {lstm_results.get('metrics', {}).get('mae', 'N/A'):.2f} kW")
+            console.print(f"   • Model Metrics - RMSE: {lstm_results.get('metrics', {}).get('rmse', 'N/A'):.2f} kW")
+            console.print(f"   • Model Metrics - MAPE: {lstm_results.get('metrics', {}).get('mape', 'N/A'):.2f}%")
+        console.print(f"   • Errors: {summary.get('total_errors', 0)} (Recovered: {summary.get('recovered_errors', 0)})")
 
     except FileNotFoundError:
-        console.print(f"[red]   Error: Data file not found: {data_path}[/red]")
+        error_msg = f"Data file not found: {data_path}"
+        console.print(f"[red]   Error: {error_msg}[/red]")
+        if tracker:
+            tracker.log_error('FileNotFoundError', error_msg, {}, recovered=False)
+            tracker.finalize()
         sys.exit(1)
     except ValueError as ve:
-        console.print(f"[red]   Error: {ve}[/red]")
+        error_msg = str(ve)
+        console.print(f"[red]   Error: {error_msg}[/red]")
+        if tracker:
+            tracker.log_error('ValueError', error_msg, {}, recovered=False)
+            tracker.finalize()
         sys.exit(1)
     except Exception as e:
-        console.print(f"[red]   Error: {str(e)}[/red]")
+        error_msg = str(e)
+        console.print(f"[red]   Error: {error_msg}[/red]")
+        if tracker:
+            tracker.log_error(type(e).__name__, error_msg, {}, recovered=False)
+            # Try to generate report even if there was an error
+            try:
+                summary = tracker.finalize()
+                report_generator = ReportGenerator(tracker)
+                report_path = report_generator.generate_report()
+                console.print(f"\n[yellow]Partial report generated: {report_path}[/yellow]")
+            except:
+                pass
         sys.exit(1)
 
 if __name__ == "__main__":

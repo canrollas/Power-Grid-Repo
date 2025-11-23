@@ -55,6 +55,7 @@ data/raw/alabama_solar_power/
 *.pkl
 *.joblib
 models/
+experiments/
 checkpoints/
 
 # Logs

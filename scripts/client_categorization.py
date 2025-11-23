@@ -12,6 +12,12 @@ Categorizes clients into:
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+import matplotlib
+# Set matplotlib backend to Agg (non-interactive) - works without tkinter
+# We save plots to files, so interactive display is not required
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
 
 
 def calculate_variance_metrics(data):
@@ -181,11 +187,11 @@ def display_categorization_results(stats, client_metrics, console=None, title_su
     title = "Client Categorization Summary"
     if title_suffix:
         title = f"{title} {title_suffix}"
-    table = Table(title=title, show_header=True, header_style="bold blue")
-    table.add_column("Category", style="cyan", width=30)
-    table.add_column("Description", style="dim", width=50)
-    table.add_column("Count", justify="right", style="green")
-    table.add_column("Percentage", justify="right", style="yellow")
+    table = Table(title=title, show_header=True, header_style="bold blue", expand=True)
+    table.add_column("Category", style="cyan", width=25, no_wrap=False)
+    table.add_column("Description", style="dim", width=45, no_wrap=False)
+    table.add_column("Count", justify="right", style="green", width=8)
+    table.add_column("Percentage", justify="right", style="yellow", width=12)
     
     table.add_row(
         "Low Variance (Stable)",
@@ -224,6 +230,71 @@ def display_categorization_results(stats, client_metrics, console=None, title_su
     
     console.print("\n")
     console.print(table)
+    
+    # Create visualization
+    try:
+        # Create output directory for plots if it doesn't exist
+        os.makedirs("data/processed/plots", exist_ok=True)
+        
+        # Prepare data for plotting
+        categories = ['Low Variance', 'High Variance', 'Sparse Data', 'Other']
+        counts = [
+            stats['low_variance']['count'],
+            stats['high_variance']['count'],
+            stats['sparse']['count'],
+            stats['other']['count']
+        ]
+        percentages = [
+            stats['low_variance']['percentage'],
+            stats['high_variance']['percentage'],
+            stats['sparse']['percentage'],
+            stats['other']['percentage']
+        ]
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Bar chart
+        colors = ['#2ecc71', '#e74c3c', '#f39c12', '#3498db']
+        bars = ax1.bar(categories, counts, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+        ax1.set_ylabel('Number of Clients', fontsize=12, fontweight='bold')
+        ax1.set_title('Client Categorization - Count', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3, axis='y')
+        ax1.set_xticklabels(categories, rotation=15, ha='right')
+        
+        # Add value labels on bars
+        for bar, count, pct in zip(bars, counts, percentages):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{count}\n({pct:.1f}%)',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        # Pie chart
+        wedges, texts, autotexts = ax2.pie(
+            percentages, 
+            labels=categories, 
+            autopct='%1.1f%%',
+            colors=colors,
+            startangle=90,
+            textprops={'fontsize': 11, 'fontweight': 'bold'}
+        )
+        ax2.set_title('Client Categorization - Percentage', fontsize=14, fontweight='bold')
+        
+        # Improve pie chart text visibility
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontweight('bold')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        plot_filename = f"categorization{title_suffix.replace(' ', '_').replace('(', '').replace(')', '')}.png"
+        plot_path = f"data/processed/plots/{plot_filename}"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        console.print(f"   [green]Visualization saved to: {plot_path}[/green]")
+        plt.close()  # Close figure to free memory
+    except Exception as e:
+        console.print(f"   [yellow]Warning: Could not create visualization: {e}[/yellow]")
 
 
 def analyze_client_categories(df, console=None, title_suffix=""):

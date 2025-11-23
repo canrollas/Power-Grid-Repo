@@ -3,8 +3,7 @@ numpy
 matplotlib
 scikit-learn
 lightgbm
-tensorflow
-tensorflow-metal
+tensorflow[and-cuda]
 seaborn
 statsmodels
 tqdm
