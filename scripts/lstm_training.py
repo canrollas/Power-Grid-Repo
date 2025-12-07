@@ -150,189 +150,238 @@ def make_sequences_1d(series_scaled, client_id_encoded, sequence_length, forecas
     return X, X_client, y
 
 
-def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horizon=1, 
-                              test_size=0.2, validation_size=0.05, console=None):
+def add_time_features(df_segment):
     """
-    Prepare multi-client data for LSTM training with TRUE time-based split.
+    Extract cyclical time features (Hour, DayOfWeek) from dataframe segment.
+    """
+    # Extract features
+    hour = df_segment.index.hour
+    day_of_week = df_segment.index.dayofweek
     
-    Her client için ayrı ayrı zaman bazlı split yapar:
-    - Her client'ın ilk %(1-test_size-validation_size) zamanı → train
-    - Her client'ın ortadaki %validation_size zamanı → validation
-    - Her client'ın son %test_size zamanı → test
-    - Sequence'ler client sınırı içinde kalır
-    - Scaler sadece train verisinden fit edilir (no data leakage)
+    # Cyclical encoding
+    # Hour (0-23)
+    hour_sin = np.sin(2 * np.pi * hour / 24)
+    hour_cos = np.cos(2 * np.pi * hour / 24)
+    # Day of week (0-6)
+    day_sin = np.sin(2 * np.pi * day_of_week / 7)
+    day_cos = np.cos(2 * np.pi * day_of_week / 7)
     
-    Args:
-        trimmed_series: dict[str, pd.Series] - Her client için trimmed seri (farklı uzunlukta zaman index'i)
-        sequence_length: Number of time steps to use as input
-        forecast_horizon: Number of steps ahead to predict
-        test_size: Proportion of data for testing (default: 0.2 for 20%)
-        validation_size: Proportion of data for validation (default: 0.05 for 5%)
-        console: Rich Console object for colored output
+    # Stack features: (n_samples, 4)
+    return np.stack([hour_sin, hour_cos, day_sin, day_cos], axis=1)
+
+
+class MultiClientDataGenerator(tf.keras.utils.Sequence):
+    """
+    Generates data for Keras model on-the-fly to avoid OOM.
+    """
+    def __init__(self, client_data_dict, scalers, client_encoder, 
+                 sequence_length=24, forecast_horizon=1, batch_size=256, 
+                 shuffle=True, is_training=True):
+        """
+        Args:
+            client_data_dict: {client_id: pd.Series} - Raw data per client
+            scalers: {client_id_encoded: scaler} - Fitted scalers
+            client_encoder: LabelEncoder
+            sequence_length: input seq len
+            forecast_horizon: output horizon
+            batch_size: batch size
+            shuffle: whether to shuffle sequences after each epoch
+            is_training: if True, returns (X, y), else (X, y) but y might be used for eval
+        """
+        self.client_data_dict = client_data_dict
+        self.scalers = scalers
+        self.client_encoder = client_encoder
+        self.sequence_length = sequence_length
+        self.forecast_horizon = forecast_horizon
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.is_training = is_training
+        
+        # Calculate valid start indices for each client
+        # Map: global_index -> (client_id, local_start_index)
+        # Optimized: cumsum of counts
+        self.client_ids = []
+        self.client_counts = []
+        self.cumulative_counts = [0]
+        
+        total_samples = 0
+        
+        # Pre-calculate counts
+        for client_id, series in client_data_dict.items():
+            # How many sequences can we interpret from this series?
+            # Length L. Valid starts: 0 to L - seq_len - horizon + 1
+            n_samples = len(series) - sequence_length - forecast_horizon + 1
+            if n_samples > 0:
+                self.client_ids.append(client_id)
+                self.client_counts.append(n_samples)
+                total_samples += n_samples
+                self.cumulative_counts.append(total_samples)
+                
+        self.total_samples = total_samples
+        self.indices = np.arange(total_samples)
+        self.cumulative_counts = np.array(self.cumulative_counts)
+        
+        print(f"Generator created: {len(self.client_ids)} clients, {total_samples:,} samples")
+        
+    def __len__(self):
+        """Number of batches per epoch"""
+        return int(np.ceil(self.total_samples / self.batch_size))
     
-    Returns:
-        dict: Contains scaled data, scaler, train/val/test splits, and client encoder
+    def __getitem__(self, index):
+        """Generate one batch of data"""
+        # Get indices for this batch
+        start_idx = index * self.batch_size
+        end_idx = min((index + 1) * self.batch_size, self.total_samples)
+        batch_indices = self.indices[start_idx:end_idx]
+        
+        X_batch = []
+        X_client_batch = []
+        y_batch = []
+        
+        for global_idx in batch_indices:
+            # Find which client this index belongs to using binary search on cumulative counts
+            # searchsorted returns insertion point. 
+            # cumulative is [0, 100, 250...]
+            # if global_idx is 50, it falls in bucket 0 (insertion point 1)
+            client_idx_idx = np.searchsorted(self.cumulative_counts, global_idx, side='right') - 1
+            
+            client_id = self.client_ids[client_idx_idx]
+            # Local index within that client's valid sequences
+            local_idx = global_idx - self.cumulative_counts[client_idx_idx]
+            
+            # Get data
+            series = self.client_data_dict[client_id]
+            
+            # Slice: [local_idx : local_idx + seq_len + horizon]
+            # We need +1 for slicing
+            slice_end = local_idx + self.sequence_length + self.forecast_horizon
+            segment = series.iloc[local_idx : slice_end]
+            
+            # Process this segment
+            # 1. Split into input and target part logic
+            segment_input = segment.iloc[:self.sequence_length]
+            segment_target = segment.iloc[self.sequence_length:]
+            
+            # 2. Get scaler
+            cid_enc = self.client_encoder.transform([client_id])[0]
+            scaler = self.scalers[cid_enc]
+            
+            # 3. Add time features to input part
+            input_time = add_time_features(segment_input) # (seq_len, 4)
+            
+            # 4. Scale consumption
+            input_cons = scaler.transform(segment_input.values.reshape(-1, 1)) # (seq_len, 1)
+            target_cons = scaler.transform(segment_target.values.reshape(-1, 1)) # (horizon, 1)
+            
+            # 5. Combine input
+            input_combined = np.hstack([input_cons, input_time]) # (seq_len, 5)
+            
+            X_batch.append(input_combined)
+            X_client_batch.append(cid_enc)
+            y_batch.append(target_cons.flatten())
+            
+        return [np.array(X_batch), np.array(X_client_batch)], np.array(y_batch)
+    
+    def on_epoch_end(self):
+        """Shuffle updates after each epoch"""
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+
+def prepare_multi_client_data_generators(trimmed_series, sequence_length=24, forecast_horizon=1, 
+                                   test_size=0.2, validation_size=0.05, batch_size=256, console=None):
+    """
+    Prepare data generators for memory-efficient training.
     """
     if console is None:
         console = Console()
     
-    console.print("   [cyan]Preparing multi-client dataset with time-based split...[/cyan]")
+    console.print("   [cyan]Preparing data generators (Memory Efficient)...[/cyan]")
     
-    # Adım 1: Client ID encoder'ı oluştur
+    # 1. Filter valid clients
     valid_clients = []
     for client_id, client_series in trimmed_series.items():
         if len(client_series) >= sequence_length + forecast_horizon + 10:
             valid_clients.append(client_id)
-    
-    if len(valid_clients) == 0:
+            
+    if not valid_clients:
         console.print("   [red]Error: No valid data found[/red]")
         return None
-    
+
+    # 2. Fit Encoder
     client_encoder = LabelEncoder()
     client_encoder.fit(valid_clients)
     
-    console.print(f"   [green]Number of valid clients: {len(valid_clients)}[/green]")
+    # 3. Pre-process splits (Store raw Series for each split)
+    # We do NOT create X_train arrays here. We just split the pandas Series objects.
+    train_series = {}
+    val_series = {}
+    test_series = {}
     
-    # Helper to add time features
-    def add_time_features(df_segment):
-        # Extract features
-        hour = df_segment.index.hour
-        day_of_week = df_segment.index.dayofweek
-        
-        # Cyclical encoding
-        # Hour (0-23)
-        hour_sin = np.sin(2 * np.pi * hour / 24)
-        hour_cos = np.cos(2 * np.pi * hour / 24)
-        # Day of week (0-6)
-        day_sin = np.sin(2 * np.pi * day_of_week / 7)
-        day_cos = np.cos(2 * np.pi * day_of_week / 7)
-        
-        # Stack features: (n_samples, 4)
-        return np.stack([hour_sin, hour_cos, day_sin, day_cos], axis=1)
-
-    # Adım 2: Her client için ayrı scaler (Per-Client Scaling)
-    scalers = {}  # {client_id_encoded: (min, max)} for optimization or full scaler objects
+    scalers = {}
     
-    # Adım 3: Her client için ayrı ayrı sequence üret
-    X_train, y_train, c_train = [], [], []
-    X_val, y_val, c_val = [], [], []
-    X_test, y_test, c_test = [], [], []
-    only_train_clients = 0
-    full_split_clients = 0
-    
-    # Progress bar için toplam iterasyon sayısı
-    total_clients_to_process = len(valid_clients)
-
+    console.print("   [dim]Splitting data and fitting scalers...[/dim]")
     
     for client_id in valid_clients:
-        client_series = trimmed_series[client_id]
-        n = len(client_series)
-        train_end_idx = int(n * (1 - test_size - validation_size))  # örn. 0.75
-        val_end_idx = int(n * (1 - test_size))  # örn. 0.95
+        series = trimmed_series[client_id]
+        n = len(series)
+        train_end_idx = int(n * (1 - test_size - validation_size))
+        val_end_idx = int(n * (1 - test_size))
         
-        if train_end_idx < sequence_length + forecast_horizon:
-            continue  # Train kısmı çok kısa, skip
+        # Split
+        train_part = series.iloc[:train_end_idx]
+        val_part = series.iloc[train_end_idx:val_end_idx] if val_end_idx > train_end_idx else None
+        test_part = series.iloc[val_end_idx:] if val_end_idx < n else None
         
-        train_part = client_series.iloc[:train_end_idx]
-        val_part = client_series.iloc[train_end_idx:val_end_idx] if val_end_idx > train_end_idx else None
-        test_part = client_series.iloc[val_end_idx:] if val_end_idx < n else None
-        
-        # Client ID'yi encode et
-        cid_enc = client_encoder.transform([client_id])[0]
-        
-        # PER-CLIENT SCALING: Create separate scaler for EACH client
-        client_scaler = MinMaxScaler()
-        # Ensure 2D array for scaler
-        client_scaler.fit(train_part.values.reshape(-1, 1))
-        
-        # Store scaler for this client (using encoded ID as key)
-        scalers[cid_enc] = client_scaler
-        
-        # Prepare TIME FEATURES for all parts
-        # Note: We compute these before scaling consumption to align dimensions easily, 
-        # but time features are already "scaled" (-1 to 1) by sin/cos.
-        
-        # Train data preparation
-        train_time = add_time_features(train_part)
-        train_cons_scaled = client_scaler.transform(train_part.values.reshape(-1, 1))
-        # Combine: [Consumption, Hour_Sin, Hour_Cos, Day_Sin, Day_Cos]
-        train_combined = np.hstack([train_cons_scaled, train_time])
-        
-        Xt, Ct, yt = make_sequences_1d(train_combined, cid_enc, sequence_length, forecast_horizon)
-        X_train.extend(Xt)
-        c_train.extend(Ct)
-        y_train.extend(yt)
-        
-        # Validation kısmı yeterli uzunlukta mı?
-        if val_part is not None and len(val_part) >= sequence_length + forecast_horizon:
-            val_time = add_time_features(val_part)
-            val_cons_scaled = client_scaler.transform(val_part.values.reshape(-1, 1))
-            val_combined = np.hstack([val_cons_scaled, val_time])
+        # Fit Scaler on TRAIN only
+        if len(train_part) > 10:
+            scaler = MinMaxScaler()
+            scaler.fit(train_part.values.reshape(-1, 1))
             
-            Xv, Cv, yv = make_sequences_1d(val_combined, cid_enc, sequence_length, forecast_horizon)
-            X_val.extend(Xv)
-            c_val.extend(Cv)
-            y_val.extend(yv)
-        else:
-            # Validation kısmı çok kısa, sadece train'e ekle (zaten eklendi)
-            pass
-        
-        # Test kısmı yeterli uzunlukta mı?
-        if test_part is not None and len(test_part) >= sequence_length + forecast_horizon:
-            test_time = add_time_features(test_part)
-            test_cons_scaled = client_scaler.transform(test_part.values.reshape(-1, 1))
-            test_combined = np.hstack([test_cons_scaled, test_time])
+            cid_enc = client_encoder.transform([client_id])[0]
+            scalers[cid_enc] = scaler
             
-            Xtst, Ctst, ytst = make_sequences_1d(test_combined, cid_enc, sequence_length, forecast_horizon)
-            X_test.extend(Xtst)
-            c_test.extend(Ctst)
-            y_test.extend(ytst)
-            full_split_clients += 1
-        else:
-            # Test kısmı çok kısa, sadece train'e ekle (zaten eklendi)
-            only_train_clients += 1
+            # Store valid parts
+            if len(train_part) >= sequence_length + forecast_horizon:
+                train_series[client_id] = train_part
+            
+            if val_part is not None and len(val_part) >= sequence_length + forecast_horizon:
+                val_series[client_id] = val_part
+                
+            if test_part is not None and len(test_part) >= sequence_length + forecast_horizon:
+                test_series[client_id] = test_part
+                
+    console.print(f"   [green]Scalers fitted for {len(scalers)} clients[/green]")
     
-    if len(X_train) == 0:
-        console.print("   [red]Error: No train sequences created[/red]")
-        return None
+    # 4. Create Generators
+    train_gen = MultiClientDataGenerator(
+        train_series, scalers, client_encoder,
+        sequence_length=sequence_length, forecast_horizon=forecast_horizon,
+        batch_size=batch_size, shuffle=True
+    )
     
-    # Numpy array'lere dönüştür
-    # X_train shape: (N, seq_len, 5) -> Consumption(1) + Time(4)
-    X_train = np.array(X_train)
-    X_val = np.array(X_val) if len(X_val) > 0 else np.array([]).reshape(0, sequence_length, 5)
-    X_test = np.array(X_test) if len(X_test) > 0 else np.array([]).reshape(0, sequence_length, 5)
-    y_train = np.array(y_train)
-    y_val = np.array(y_val) if len(y_val) > 0 else np.array([]).reshape(0, forecast_horizon)
-    y_test = np.array(y_test) if len(y_test) > 0 else np.array([]).reshape(0, forecast_horizon)
-    c_train = np.array(c_train)
-    c_val = np.array(c_val) if len(c_val) > 0 else np.array([])
-    c_test = np.array(c_test) if len(c_test) > 0 else np.array([])
+    val_gen = MultiClientDataGenerator(
+        val_series, scalers, client_encoder,
+        sequence_length=sequence_length, forecast_horizon=forecast_horizon,
+        batch_size=batch_size, shuffle=False
+    )
     
-    console.print(f"   [green]Created {len(X_train):,} train sequences[/green]")
-    if len(X_val) > 0:
-        console.print(f"   [green]Created {len(X_val):,} validation sequences[/green]")
-    if len(X_test) > 0:
-        console.print(f"   [green]Created {len(X_test):,} test sequences[/green]")
-    else:
-        console.print(f"   [yellow]Warning: No test sequences created (test parts too short)[/yellow]")
+    test_gen = MultiClientDataGenerator(
+        test_series, scalers, client_encoder,
+        sequence_length=sequence_length, forecast_horizon=forecast_horizon,
+        batch_size=batch_size, shuffle=False
+    )
     
-    if only_train_clients > 0:
-        console.print(f"   [dim]Only-train clients: {only_train_clients} (test parts too short)[/dim]")
-    if full_split_clients > 0:
-        console.print(f"   [dim]Full-split clients: {full_split_clients} (train/val/test)[/dim]")
+    console.print(f"   [green]Generators ready:[/green]")
+    console.print(f"   [dim]Train samples: {train_gen.total_samples:,}[/dim]")
+    console.print(f"   [dim]Val samples:   {val_gen.total_samples:,}[/dim]")
+    console.print(f"   [dim]Test samples:  {test_gen.total_samples:,}[/dim]")
     
     return {
-        'X_train': X_train,
-        'X_val': X_val,
-        'X_test': X_test,
-        'X_client_train': c_train,
-        'X_client_val': c_val,
-        'X_client_test': c_test,
-        'y_train': y_train,
-        'y_val': y_val,
-        'y_test': y_test,
-        'y_test': y_test,
-        'scalers': scalers,  # Return dict of scalers instead of single scaler
+        'train_gen': train_gen,
+        'val_gen': val_gen,
+        'test_gen': test_gen,
+        'scalers': scalers,
         'client_encoder': client_encoder,
         'n_clients': len(client_encoder.classes_)
     }
@@ -500,11 +549,7 @@ def create_multi_client_lstm_model(sequence_length=24, n_clients=370,
         dropout_rate: Dropout rate
         learning_rate: Learning rate
         num_layers: Number of LSTM layers
-        input_dim: Number of input features (1 for cons only, 5 with time features)
-        lstm_units: Number of LSTM units
-        dropout_rate: Dropout rate
-        learning_rate: Learning rate
-        num_layers: Number of LSTM layers
+        input_dim: Number of input features
     
     Returns:
         Compiled Keras model
@@ -613,20 +658,34 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
     # Show device configuration
     configure_tensorflow_devices(console)
     
-    # Prepare data
-    data_dict = prepare_multi_client_data(
+    # Adım 1: Veriyi hazırla (Generator kullanarak)
+    data_dict = prepare_multi_client_data_generators(
         trimmed_series,
         sequence_length=sequence_length,
         forecast_horizon=forecast_horizon,
         test_size=0.2,  # 20% test
         validation_size=validation_size,  # 5% validation
+        batch_size=batch_size,
         console=console
     )
     
     if data_dict is None:
-        return None
+        console.print("   [red]Data preparation failed[/red]")
+        return None, []
+        
+    train_gen = data_dict['train_gen']
+    val_gen = data_dict['val_gen']
+    test_gen = data_dict['test_gen']
     
     n_clients = data_dict['n_clients']
+    
+    if tracker:
+        tracker.log_step("DATA_PREPARATION", 
+                        f"Prepared data for {n_clients} clients using Generators", 
+                        {'n_clients': n_clients, 
+                         'train_samples': train_gen.total_samples,
+                         'val_samples': val_gen.total_samples,
+                         'test_samples': test_gen.total_samples})
     
     # Create model
     console.print(f"\n[bold]Creating model...[/bold]")
@@ -659,7 +718,7 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
         console.print("   [yellow]Mixed precision not available, using FP32[/yellow]")
     
     # Validation seti var mı kontrol et
-    has_validation = len(data_dict['X_val']) > 0
+    has_validation = val_gen.total_samples > 0
     
     # Callbacks - validation seti varsa val_loss, yoksa loss kullan
     monitor_metric = 'val_loss' if has_validation else 'loss'
@@ -698,20 +757,17 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
     console.print(f"   [dim]En iyi model her epoch'ta otomatik kaydedilecek[/dim]")
     
     # Rich progress bar callback - steps_per_epoch hesapla
-    train_size = len(data_dict['X_train'])
-    steps_per_epoch = (train_size + batch_size - 1) // batch_size  # Ceiling division
     rich_progress = RichProgressCallback(total_epochs=epochs, console=console)
-    rich_progress.total_batches = steps_per_epoch
+    rich_progress.total_batches = len(train_gen)
     
     try:
         # Validation seti varsa manuel olarak geç, yoksa validation_split kullanma
+        # Validation seti varsa manuel olarak geç, yoksa validation_split kullanma
         if has_validation:
             history = model.fit(
-                [data_dict['X_train'], data_dict['X_client_train']],
-                data_dict['y_train'],
-                validation_data=([data_dict['X_val'], data_dict['X_client_val']], data_dict['y_val']),
+                train_gen,
+                validation_data=val_gen,
                 epochs=epochs,
-                batch_size=batch_size,
                 callbacks=[early_stopping, reduce_lr, model_checkpoint, rich_progress],
                 verbose=0  # Rich callback kullanıyoruz, TensorFlow'un verbose'unu kapatıyoruz
             )
@@ -740,10 +796,8 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
                 save_weights_only=False
             )
             history = model.fit(
-                [data_dict['X_train'], data_dict['X_client_train']],
-                data_dict['y_train'],
+                train_gen,
                 epochs=epochs,
-                batch_size=batch_size,
                 callbacks=[early_stopping, reduce_lr, model_checkpoint, rich_progress],
                 verbose=0
             )
@@ -760,63 +814,80 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
             console.print(f"   [red]Error during training: {e}[/red]")
             return None
     
-    # Evaluate on test set
-    if len(data_dict['X_test']) == 0:
-        console.print(f"\n[yellow]Warning: Test set is empty, skipping evaluation[/yellow]")
-        console.print(f"   [dim]This can happen if test parts of clients are too short[/dim]")
-        metrics = {
-            'mae': None,
-            'rmse': None,
-            'mape': None,
-            'mse': None,
-            'r2': None
-        }
-        test_pred_inv = None
-        test_actual_inv = None
-    else:
-        console.print(f"\n[bold]Evaluating on test set...[/bold]")
-        test_predictions = model.predict(
-            [data_dict['X_test'], data_dict['X_client_test']],
-            batch_size=batch_size,
-            verbose=0
-        )
-        test_actual = data_dict['y_test']
+    # Adım 4: Evaluation
+    console.print("\n[bold]Evaluating model...[/bold]")
+    
+    # Predict on test set using Generator
+    test_gen = data_dict['test_gen']
+    if test_gen.total_samples == 0:
+        console.print("   [yellow]No test data available for evaluation[/yellow]")
+        return {}, []
         
-        # Inverse transform ONLY for test set evaluation
-        # We need to inverse transform each sample using its corresponding client's scaler
+    test_predictions = model.predict(test_gen, verbose=1)
+    
+    # Retrieve Actuals and Client IDs from generator manually
+    test_actual = []
+    test_client_ids = []
+    
+    # Iterate through generator to get truth values
+    # Note: Generator yields ([X, ids], y)
+    for i in range(len(test_gen)):
+        (_, ids_batch), y_batch = test_gen[i]
+        test_actual.extend(y_batch)
+        test_client_ids.extend(ids_batch)
+    
+    test_actual = np.array(test_actual)
+    test_client_ids = np.array(test_client_ids)
+    
+    # Inverse transform logic remains similar, but using collected arrays
+    # ...
+    
+    test_pred_inv = []
+    test_actual_inv = []
+    
+    # Inverse transform using per-client scalers
+    # We need to process sample by sample or group by client for efficiency
+    
+    # Group indices by client to do batch inverse transform
+    client_indices = {}
+    for i, cid_enc in enumerate(test_client_ids):
+        if cid_enc not in client_indices:
+            client_indices[cid_enc] = []
+        client_indices[cid_enc].append(i)
         
-        # Initialize arrays for inverse values
-        test_pred_inv = np.zeros_like(test_predictions)
-        test_actual_inv = np.zeros_like(test_actual)
-        
-        # Get unique clients in test set
-        test_client_ids = data_dict['X_client_test']
-        unique_test_clients = np.unique(test_client_ids)
-        
-        console.print(f"   [dim]Inverse transforming predictions for {len(unique_test_clients)} clients...[/dim]")
-        
-        # Iterate over each client in the test set
-        for client_enc in unique_test_clients:
-            # Find indices for this client
-            client_indices = np.where(test_client_ids == client_enc)[0]
+    # Prepare result arrays
+    test_pred_inv_arr = np.zeros_like(test_predictions)
+    test_actual_inv_arr = np.zeros_like(test_actual)
+    
+    console.print("   [dim]Inverse transforming predictions...[/dim]")
+    
+    for cid_enc, indices in client_indices.items():
+        if cid_enc in data_dict['scalers']:
+            scaler = data_dict['scalers'][cid_enc]
             
-            # Get scaler for this client
-            if client_enc in data_dict['scalers']:
-                client_scaler = data_dict['scalers'][client_enc]
-                
-                # Get predictions and actuals for this client
-                client_preds = test_predictions[client_indices]
-                client_actuals = test_actual[client_indices]
-                
-                # Inverse transform
-                test_pred_inv[client_indices] = client_scaler.inverse_transform(client_preds)
-                test_actual_inv[client_indices] = client_scaler.inverse_transform(client_actuals)
-            else:
-                # Should not happen, but fallback just in case
-                console.print(f"   [yellow]Warning: Scaler not found for client {client_enc}[/yellow]")
-                test_pred_inv[client_indices] = test_predictions[client_indices]
-                test_actual_inv[client_indices] = test_actual[client_indices]
-                
+            # Get data for this client
+            pred_subset = test_predictions[indices]
+            actual_subset = test_actual[indices]
+            
+            # Inverse transform
+            # Scaler expects 2D array
+            pred_inv = scaler.inverse_transform(pred_subset)
+            actual_inv = scaler.inverse_transform(actual_subset)
+            
+            # Fill result arrays
+            test_pred_inv_arr[indices] = pred_inv
+            test_actual_inv_arr[indices] = actual_inv
+            
+    test_pred_inv = test_pred_inv_arr
+    test_actual_inv = test_actual_inv_arr
+    
+    # Compute metrics
+    # ...
+    metrics = {
+        'mae': np.mean(np.abs(test_pred_inv - test_actual_inv)),
+        'rmse': np.sqrt(np.mean((test_pred_inv - test_actual_inv)**2)),
+        'mape': np.mean(np.abs((test_actual_inv - test_pred_inv) / (test_actual_inv + 1e-6))) * 100
+    }            
         # data_dict['scaler'] is no longer used/available as a single object
         # but we need to return something compatible if needed
         # We will return the dict of scalers in the result map
