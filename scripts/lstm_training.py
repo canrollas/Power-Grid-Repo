@@ -280,7 +280,10 @@ class MultiClientDataGenerator(tf.keras.utils.Sequence):
             X_client_batch.append(cid_enc)
             y_batch.append(target_cons.flatten())
             
-        return [np.array(X_batch), np.array(X_client_batch)], np.array(y_batch)
+        return {
+            'consumption_sequence': np.array(X_batch), 
+            'client_id': np.array(X_client_batch)
+        }, np.array(y_batch)
     
     def on_epoch_end(self):
         """Shuffle updates after each epoch"""
@@ -830,11 +833,11 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
     test_client_ids = []
     
     # Iterate through generator to get truth values
-    # Note: Generator yields ([X, ids], y)
+    # Note: Generator yields ({'consumption_sequence': X, 'client_id': ids}, y)
     for i in range(len(test_gen)):
-        (_, ids_batch), y_batch = test_gen[i]
+        inputs_batch, y_batch = test_gen[i]
         test_actual.extend(y_batch)
-        test_client_ids.extend(ids_batch)
+        test_client_ids.extend(inputs_batch['client_id'])
     
     test_actual = np.array(test_actual)
     test_client_ids = np.array(test_client_ids)
