@@ -883,46 +883,33 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
     
     # Compute metrics
     # ...
+    # Compute metrics
+    mae = np.mean(np.abs(test_pred_inv - test_actual_inv))
+    rmse = np.sqrt(np.mean((test_pred_inv - test_actual_inv) ** 2))
+    mse = np.mean((test_pred_inv - test_actual_inv) ** 2)
+    
+    # R2 Calculation
+    ss_res = np.sum((test_actual_inv - test_pred_inv) ** 2)
+    ss_tot = np.sum((test_actual_inv - np.mean(test_actual_inv)) ** 2)
+    # Avoid division by zero
+    r2 = 1 - (ss_res / (ss_tot + 1e-8))
+    
+    # MAPE
+    mape = np.mean(np.abs((test_actual_inv - test_pred_inv) / (test_actual_inv + 1e-6))) * 100
+
     metrics = {
-        'mae': np.mean(np.abs(test_pred_inv - test_actual_inv)),
-        'rmse': np.sqrt(np.mean((test_pred_inv - test_actual_inv)**2)),
-        'mape': np.mean(np.abs((test_actual_inv - test_pred_inv) / (test_actual_inv + 1e-6))) * 100
-    }            
-        # data_dict['scaler'] is no longer used/available as a single object
-        # but we need to return something compatible if needed
-        # We will return the dict of scalers in the result map
+        'mae': float(mae),
+        'rmse': float(rmse),
+        'mape': float(mape),
+        'mse': float(mse),
+        'r2': float(r2)
+    }
         
-        # Calculate metrics
-        mae = np.mean(np.abs(test_pred_inv - test_actual_inv))
-        rmse = np.sqrt(np.mean((test_pred_inv - test_actual_inv) ** 2))
-        
-        # Improved MAPE calculation
-        threshold = np.abs(test_actual_inv).mean() * 0.01
-        mask = np.abs(test_actual_inv) > threshold
-        
-        if mask.sum() > 0:
-            mape = np.mean(np.abs((test_actual_inv[mask] - test_pred_inv[mask]) / test_actual_inv[mask])) * 100
-        else:
-            mape = np.mean(np.abs(test_actual_inv - test_pred_inv) / 
-                          (np.abs(test_actual_inv) + np.abs(test_pred_inv) + 1e-8)) * 100
-        
-        mse = np.mean((test_pred_inv - test_actual_inv) ** 2)
-        r2 = 1 - (np.sum((test_actual_inv - test_pred_inv) ** 2) / 
-                 np.sum((test_actual_inv - np.mean(test_actual_inv)) ** 2))
-        
-        metrics = {
-            'mae': float(mae),
-            'rmse': float(rmse),
-            'mape': float(mape),
-            'mse': float(mse),
-            'r2': float(r2)
-        }
-        
-        console.print(f"\n[bold]Test Set Metrics:[/bold]")
-        console.print(f"   [green]MAE: {metrics['mae']:.2f} kW[/green]")
-        console.print(f"   [green]RMSE: {metrics['rmse']:.2f} kW[/green]")
-        console.print(f"   [green]MAPE: {metrics['mape']:.2f}%[/green]")
-        console.print(f"   [green]R²: {metrics['r2']:.4f}[/green]")
+    console.print(f"\n[bold]Test Set Metrics:[/bold]")
+    console.print(f"   [green]MAE: {metrics['mae']:.2f} kW[/green]")
+    console.print(f"   [green]RMSE: {metrics['rmse']:.2f} kW[/green]")
+    console.print(f"   [green]MAPE: {metrics['mape']:.2f}%[/green]")
+    console.print(f"   [green]R²: {metrics['r2']:.4f}[/green]")
     
     # Log to tracker
     if tracker:
