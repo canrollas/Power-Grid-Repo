@@ -389,13 +389,13 @@ def main():
             error_handler=error_handler,
             sequence_length=24,
             forecast_horizon=1,
-            embedding_dim=8,  # Reduced for speed
-            lstm_units=32,  # Reduced for speed
+            embedding_dim=16,  # Increased for better client representation
+            lstm_units=64,  # Increased for better learning capacity
             dropout_rate=0.2,
-            learning_rate=0.001,
-            num_layers=1,  # Reduced for speed
-            batch_size=512,  # Increased for speed (4x fewer steps)
-            epochs=20  # Reduced for speed
+            learning_rate=0.002,  # Increased for faster learning
+            num_layers=2,  # Increased for deeper learning
+            batch_size=256,  # Reduced for better gradient updates
+            epochs=20
         )
         console.print("="*60)
         

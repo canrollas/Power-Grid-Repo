@@ -132,12 +132,20 @@ def make_sequences_1d(series_scaled, client_id_encoded, sequence_length, forecas
         X_client: Client IDs for each sequence (samples,)
         y: Target values (samples, forecast_horizon)
     """
+    
     X, X_client, y = [], [], []
     
+    # Check if series is 1D or 2D
+    if len(series_scaled.shape) == 1:
+        # Backward compatibility for 1D array
+        series_scaled = series_scaled.reshape(-1, 1)
+        
     for i in range(len(series_scaled) - sequence_length - forecast_horizon + 1):
+        # Input: All features (Consumption + Time Embeddings)
         X.append(series_scaled[i:i + sequence_length])
         X_client.append(client_id_encoded)
-        y.append(series_scaled[i + sequence_length:i + sequence_length + forecast_horizon])
+        # Target: Only Consumption (Index 0)
+        y.append(series_scaled[i + sequence_length:i + sequence_length + forecast_horizon, 0])
     
     return X, X_client, y
 
@@ -185,29 +193,25 @@ def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horiz
     
     console.print(f"   [green]Number of valid clients: {len(valid_clients)}[/green]")
     
-    # Adım 2: Sadece train verisinden scaler fit et
-    train_values = []
-    
-    for client_id in valid_clients:
-        client_series = trimmed_series[client_id]
-        n = len(client_series)
-        train_end_idx = int(n * (1 - test_size - validation_size))  # örn. 0.75
+    # Helper to add time features
+    def add_time_features(df_segment):
+        # Extract features
+        hour = df_segment.index.hour
+        day_of_week = df_segment.index.dayofweek
         
-        if train_end_idx < sequence_length + forecast_horizon:
-            continue  # Train kısmı çok kısa, skip
+        # Cyclical encoding
+        # Hour (0-23)
+        hour_sin = np.sin(2 * np.pi * hour / 24)
+        hour_cos = np.cos(2 * np.pi * hour / 24)
+        # Day of week (0-6)
+        day_sin = np.sin(2 * np.pi * day_of_week / 7)
+        day_cos = np.cos(2 * np.pi * day_of_week / 7)
         
-        train_part = client_series.iloc[:train_end_idx]
-        train_values.append(train_part.values)
-    
-    if len(train_values) == 0:
-        console.print("   [red]Error: No valid train data found[/red]")
-        return None
-    
-    train_values = np.concatenate(train_values).reshape(-1, 1)
-    scaler = MinMaxScaler()
-    scaler.fit(train_values)
-    
-    console.print(f"   [green]Scaler fitted on {len(train_values):,} train data points[/green]")
+        # Stack features: (n_samples, 4)
+        return np.stack([hour_sin, hour_cos, day_sin, day_cos], axis=1)
+
+    # Adım 2: Her client için ayrı scaler (Per-Client Scaling)
+    scalers = {}  # {client_id_encoded: (min, max)} for optimization or full scaler objects
     
     # Adım 3: Her client için ayrı ayrı sequence üret
     X_train, y_train, c_train = [], [], []
@@ -215,6 +219,10 @@ def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horiz
     X_test, y_test, c_test = [], [], []
     only_train_clients = 0
     full_split_clients = 0
+    
+    # Progress bar için toplam iterasyon sayısı
+    total_clients_to_process = len(valid_clients)
+
     
     for client_id in valid_clients:
         client_series = trimmed_series[client_id]
@@ -232,17 +240,36 @@ def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horiz
         # Client ID'yi encode et
         cid_enc = client_encoder.transform([client_id])[0]
         
-        # Scale train kısmı
-        train_scaled = scaler.transform(train_part.values.reshape(-1, 1)).flatten()
-        Xt, Ct, yt = make_sequences_1d(train_scaled, cid_enc, sequence_length, forecast_horizon)
+        # PER-CLIENT SCALING: Create separate scaler for EACH client
+        client_scaler = MinMaxScaler()
+        # Ensure 2D array for scaler
+        client_scaler.fit(train_part.values.reshape(-1, 1))
+        
+        # Store scaler for this client (using encoded ID as key)
+        scalers[cid_enc] = client_scaler
+        
+        # Prepare TIME FEATURES for all parts
+        # Note: We compute these before scaling consumption to align dimensions easily, 
+        # but time features are already "scaled" (-1 to 1) by sin/cos.
+        
+        # Train data preparation
+        train_time = add_time_features(train_part)
+        train_cons_scaled = client_scaler.transform(train_part.values.reshape(-1, 1))
+        # Combine: [Consumption, Hour_Sin, Hour_Cos, Day_Sin, Day_Cos]
+        train_combined = np.hstack([train_cons_scaled, train_time])
+        
+        Xt, Ct, yt = make_sequences_1d(train_combined, cid_enc, sequence_length, forecast_horizon)
         X_train.extend(Xt)
         c_train.extend(Ct)
         y_train.extend(yt)
         
         # Validation kısmı yeterli uzunlukta mı?
         if val_part is not None and len(val_part) >= sequence_length + forecast_horizon:
-            val_scaled = scaler.transform(val_part.values.reshape(-1, 1)).flatten()
-            Xv, Cv, yv = make_sequences_1d(val_scaled, cid_enc, sequence_length, forecast_horizon)
+            val_time = add_time_features(val_part)
+            val_cons_scaled = client_scaler.transform(val_part.values.reshape(-1, 1))
+            val_combined = np.hstack([val_cons_scaled, val_time])
+            
+            Xv, Cv, yv = make_sequences_1d(val_combined, cid_enc, sequence_length, forecast_horizon)
             X_val.extend(Xv)
             c_val.extend(Cv)
             y_val.extend(yv)
@@ -252,8 +279,11 @@ def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horiz
         
         # Test kısmı yeterli uzunlukta mı?
         if test_part is not None and len(test_part) >= sequence_length + forecast_horizon:
-            test_scaled = scaler.transform(test_part.values.reshape(-1, 1)).flatten()
-            Xtst, Ctst, ytst = make_sequences_1d(test_scaled, cid_enc, sequence_length, forecast_horizon)
+            test_time = add_time_features(test_part)
+            test_cons_scaled = client_scaler.transform(test_part.values.reshape(-1, 1))
+            test_combined = np.hstack([test_cons_scaled, test_time])
+            
+            Xtst, Ctst, ytst = make_sequences_1d(test_combined, cid_enc, sequence_length, forecast_horizon)
             X_test.extend(Xtst)
             c_test.extend(Ctst)
             y_test.extend(ytst)
@@ -267,9 +297,10 @@ def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horiz
         return None
     
     # Numpy array'lere dönüştür
-    X_train = np.array(X_train)[..., np.newaxis]  # (N, seq_len, 1)
-    X_val = np.array(X_val)[..., np.newaxis] if len(X_val) > 0 else np.array([]).reshape(0, sequence_length, 1)
-    X_test = np.array(X_test)[..., np.newaxis] if len(X_test) > 0 else np.array([]).reshape(0, sequence_length, 1)
+    # X_train shape: (N, seq_len, 5) -> Consumption(1) + Time(4)
+    X_train = np.array(X_train)
+    X_val = np.array(X_val) if len(X_val) > 0 else np.array([]).reshape(0, sequence_length, 5)
+    X_test = np.array(X_test) if len(X_test) > 0 else np.array([]).reshape(0, sequence_length, 5)
     y_train = np.array(y_train)
     y_val = np.array(y_val) if len(y_val) > 0 else np.array([]).reshape(0, forecast_horizon)
     y_test = np.array(y_test) if len(y_test) > 0 else np.array([]).reshape(0, forecast_horizon)
@@ -300,7 +331,8 @@ def prepare_multi_client_data(trimmed_series, sequence_length=24, forecast_horiz
         'y_train': y_train,
         'y_val': y_val,
         'y_test': y_test,
-        'scaler': scaler,
+        'y_test': y_test,
+        'scalers': scalers,  # Return dict of scalers instead of single scaler
         'client_encoder': client_encoder,
         'n_clients': len(client_encoder.classes_)
     }
@@ -383,16 +415,27 @@ class RichProgressCallback(tf.keras.callbacks.Callback):
         loss = logs.get('loss', 0) if logs else 0
         mae = logs.get('mae', 0) if logs else 0
         
+        # Format loss and MAE for better readability (normalized scale)
+        if loss < 1e-3:
+            loss_str = f"{loss:.2e}"
+        else:
+            loss_str = f"{loss:.6f}"
+        
+        if mae < 1e-3:
+            mae_str = f"{mae:.2e}"
+        else:
+            mae_str = f"{mae:.6f}"
+        
         if self.total_batches:
             self.progress.update(
                 self.batch_task,
                 advance=1,
-                description=f"  [dim]Batch {self.current_batch}/{self.total_batches} - loss: {loss:.6e}, mae: {mae:.6e}[/dim]"
+                description=f"  [dim]Batch {self.current_batch}/{self.total_batches} - loss: {loss_str} (norm), mae: {mae_str} (norm)[/dim]"
             )
         else:
             self.progress.update(
                 self.batch_task,
-                description=f"  [dim]Batch {self.current_batch} - loss: {loss:.6e}, mae: {mae:.6e}[/dim]"
+                description=f"  [dim]Batch {self.current_batch} - loss: {loss_str} (norm), mae: {mae_str} (norm)[/dim]"
             )
         
     def on_epoch_end(self, epoch, logs=None):
@@ -413,10 +456,17 @@ class RichProgressCallback(tf.keras.callbacks.Callback):
         elif hasattr(lr, 'numpy'):
             lr = float(lr.numpy())
         
+        # Format metrics for better readability
+        def format_metric(val):
+            if val < 1e-3:
+                return f"{val:.2e}"
+            else:
+                return f"{val:.6f}"
+        
         self.console.print(
             f"   [green]✓[/green] Epoch {self.current_epoch}/{self.total_epochs} - "
-            f"loss: {loss:.6e}, mae: {mae:.6e}, "
-            f"val_loss: {val_loss:.6e}, val_mae: {val_mae:.6e}, "
+            f"loss: {format_metric(loss)} (norm), mae: {format_metric(mae)} (norm), "
+            f"val_loss: {format_metric(val_loss)} (norm), val_mae: {format_metric(val_mae)} (norm), "
             f"lr: {lr:.6f}"
         )
         
@@ -435,14 +485,22 @@ class RichProgressCallback(tf.keras.callbacks.Callback):
 def create_multi_client_lstm_model(sequence_length=24, n_clients=370, 
                                    embedding_dim=8, lstm_units=32, 
                                    dropout_rate=0.2, learning_rate=0.001, 
-                                   num_layers=1):
+                                   num_layers=1, input_dim=5):
     """
     Create multi-client LSTM model with client_id embedding.
     
     Args:
         sequence_length: Input sequence length
         n_clients: Number of unique clients
+    Args:
+        sequence_length: Input sequence length
+        n_clients: Number of unique clients
         embedding_dim: Dimension of client embedding
+        lstm_units: Number of LSTM units
+        dropout_rate: Dropout rate
+        learning_rate: Learning rate
+        num_layers: Number of LSTM layers
+        input_dim: Number of input features (1 for cons only, 5 with time features)
         lstm_units: Number of LSTM units
         dropout_rate: Dropout rate
         learning_rate: Learning rate
@@ -452,7 +510,8 @@ def create_multi_client_lstm_model(sequence_length=24, n_clients=370,
         Compiled Keras model
     """
     # Input 1: Time series sequence
-    sequence_input = tf.keras.Input(shape=(sequence_length, 1), name='consumption_sequence')
+    # Shape: (sequence_length, input_dim) -> e.g., (24, 5)
+    sequence_input = tf.keras.Input(shape=(sequence_length, input_dim), name='consumption_sequence')
     
     # Input 2: Client ID
     client_input = tf.keras.Input(shape=(1,), name='client_id')
@@ -473,7 +532,7 @@ def create_multi_client_lstm_model(sequence_length=24, n_clients=370,
     # Concatenate sequence with client embedding
     combined = tf.keras.layers.Concatenate(axis=-1)([sequence_input, client_embedding_expanded])
     
-    # LSTM layers
+    # LSTM layers - Improved architecture
     x = combined
     for i in range(num_layers):
         return_sequences = (i < num_layers - 1)
@@ -482,7 +541,14 @@ def create_multi_client_lstm_model(sequence_length=24, n_clients=370,
             return_sequences=return_sequences,
             name=f'lstm_{i+1}'
         )(x)
+        # Batch normalization for better training stability
+        if return_sequences:
+            x = tf.keras.layers.BatchNormalization(name=f'bn_{i+1}')(x)
         x = tf.keras.layers.Dropout(dropout_rate, name=f'dropout_{i+1}')(x)
+    
+    # Add a dense layer before output for better representation
+    x = tf.keras.layers.Dense(lstm_units // 2, activation='relu', name='dense_hidden')(x)
+    x = tf.keras.layers.Dropout(dropout_rate * 0.5, name='dropout_output')(x)
     
     # Dense output layer (cast to float32 for mixed precision)
     output = tf.keras.layers.Dense(1, name='consumption_prediction', dtype='float32')(x)
@@ -494,8 +560,13 @@ def create_multi_client_lstm_model(sequence_length=24, n_clients=370,
         name='multi_client_lstm'
     )
     
-    # Compile model
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    # Compile model with improved optimizer settings
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=learning_rate,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-7
+    )
     model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
     
     return model
@@ -569,7 +640,8 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
         lstm_units=lstm_units,
         dropout_rate=dropout_rate,
         learning_rate=learning_rate,
-        num_layers=num_layers
+        num_layers=num_layers,
+        input_dim=5  # Explicitly set to 5 for consumption + 4 time features
     )
     
     console.print(f"   [green]Model created with {model.count_params():,} parameters[/green]")
@@ -710,9 +782,44 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
         )
         test_actual = data_dict['y_test']
         
-        # Inverse transform
-        test_pred_inv = data_dict['scaler'].inverse_transform(test_predictions)
-        test_actual_inv = data_dict['scaler'].inverse_transform(test_actual)
+        # Inverse transform ONLY for test set evaluation
+        # We need to inverse transform each sample using its corresponding client's scaler
+        
+        # Initialize arrays for inverse values
+        test_pred_inv = np.zeros_like(test_predictions)
+        test_actual_inv = np.zeros_like(test_actual)
+        
+        # Get unique clients in test set
+        test_client_ids = data_dict['X_client_test']
+        unique_test_clients = np.unique(test_client_ids)
+        
+        console.print(f"   [dim]Inverse transforming predictions for {len(unique_test_clients)} clients...[/dim]")
+        
+        # Iterate over each client in the test set
+        for client_enc in unique_test_clients:
+            # Find indices for this client
+            client_indices = np.where(test_client_ids == client_enc)[0]
+            
+            # Get scaler for this client
+            if client_enc in data_dict['scalers']:
+                client_scaler = data_dict['scalers'][client_enc]
+                
+                # Get predictions and actuals for this client
+                client_preds = test_predictions[client_indices]
+                client_actuals = test_actual[client_indices]
+                
+                # Inverse transform
+                test_pred_inv[client_indices] = client_scaler.inverse_transform(client_preds)
+                test_actual_inv[client_indices] = client_scaler.inverse_transform(client_actuals)
+            else:
+                # Should not happen, but fallback just in case
+                console.print(f"   [yellow]Warning: Scaler not found for client {client_enc}[/yellow]")
+                test_pred_inv[client_indices] = test_predictions[client_indices]
+                test_actual_inv[client_indices] = test_actual[client_indices]
+                
+        # data_dict['scaler'] is no longer used/available as a single object
+        # but we need to return something compatible if needed
+        # We will return the dict of scalers in the result map
         
         # Calculate metrics
         mae = np.mean(np.abs(test_pred_inv - test_actual_inv))
@@ -754,7 +861,7 @@ def train_multi_client_lstm(trimmed_series, console=None, tracker=None, error_ha
     
     return {
         'model': model,
-        'scaler': data_dict['scaler'],
+        'scalers': data_dict['scalers'],
         'client_encoder': data_dict['client_encoder'],
         'metrics': metrics,
         'test_predictions': test_pred_inv,
@@ -780,17 +887,17 @@ def run_lstm_training(trimmed_series, console=None, tracker=None, error_handler=
     if console is None:
         console = Console()
     
-    # Default parameters (optimized for speed)
+    # Default parameters (optimized for better learning)
     default_params = {
         'sequence_length': 24,
         'forecast_horizon': 1,
-        'embedding_dim': 8,  # Reduced from 16
-        'lstm_units': 32,  # Reduced from 64
+        'embedding_dim': 16,  # Increased for better client representation
+        'lstm_units': 64,  # Increased for better learning capacity
         'dropout_rate': 0.2,
-        'learning_rate': 0.001,
-        'num_layers': 1,  # Reduced from 2
-        'batch_size': 512,  # Increased from 128 (4x faster)
-        'epochs': 20,  # Reduced from 50
+        'learning_rate': 0.002,  # Increased for faster learning
+        'num_layers': 2,  # Increased for deeper learning
+        'batch_size': 256,  # Reduced for better gradient updates
+        'epochs': 20,
         'validation_size': 0.05  # 5% validation (time-based split)
     }
     
