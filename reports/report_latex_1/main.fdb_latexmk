@@ -1,9 +1,9 @@
 # Fdb version 4
-["pdflatex"] 1765225787.6726 "/home/canozor/Desktop/Power-Grid-Repo/reports/report_latex_1/main.tex" "main.pdf" "main" 1765225788.22508 0
+["pdflatex"] 1765225924.80494 "/home/canozor/Desktop/Power-Grid-Repo/reports/report_latex_1/main.tex" "main.pdf" "main" 1765225925.39709 0
   "../../data/processed/plots/test_results/random_sample_1.png" 1765219117.53624 55645 bced9f27877fada9c34bfe002468642b ""
   "../../data/processed/plots/test_results/random_sample_2.png" 1765219117.59924 51537 aabf1af6d4036c52bb9f9a896f46e299 ""
   "/etc/texmf/web2c/texmf.cnf" 1765216428.49358 475 c0e671620eb5563b2130f56340a5fde8 ""
-  "/home/canozor/Desktop/Power-Grid-Repo/reports/report_latex_1/main.tex" 1765225786.93394 16220 d5c3276fea6dcf5f15d3ed7700c8544e ""
+  "/home/canozor/Desktop/Power-Grid-Repo/reports/report_latex_1/main.tex" 1765225924.64728 16224 8ba27a45231dcb965c4c988ec4f786f1 ""
   "/usr/share/texlive/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/jknappen/ec/ecbx0800.tfm" 1136768653 3584 269b66e921ba58750c12f7f1c8ea3ebd ""
   "/usr/share/texlive/texmf-dist/fonts/tfm/jknappen/ec/ecbx1000.tfm" 1136768653 3584 2d666ecf6d466d8b007246bc2f94d9da ""
@@ -196,9 +196,9 @@
   "/usr/share/texmf/web2c/texmf.cnf" 1707919699 40399 f2c302f7d2af602abb742093540a5834 ""
   "/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map" 1765220085.01587 5312232 f3296911be9cc021788f3f879cf0a47d ""
   "/var/lib/texmf/web2c/pdftex/pdflatex.fmt" 1765220098 6800786 18f8b98e65177f77cb82a85333ff9086 ""
-  "main.aux" 1765225788.1594 3646 18f3899092b77879d59694de435524a6 "pdflatex"
-  "main.out" 1765225788.15988 2965 cfe62e1957016feb7961aa450e135973 "pdflatex"
-  "main.tex" 1765225786.93394 16220 d5c3276fea6dcf5f15d3ed7700c8544e ""
+  "main.aux" 1765225925.32928 3646 18f3899092b77879d59694de435524a6 "pdflatex"
+  "main.out" 1765225925.32928 2965 cfe62e1957016feb7961aa450e135973 "pdflatex"
+  "main.tex" 1765225924.64728 16224 8ba27a45231dcb965c4c988ec4f786f1 ""
   (generated)
   "main.aux"
   "main.log"
