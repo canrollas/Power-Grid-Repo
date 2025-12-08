@@ -394,13 +394,22 @@ def main():
             dropout_rate=0.2,
             learning_rate=0.002,  # Increased for faster learning
             num_layers=2,  # Increased for deeper learning
-            batch_size=256,  # Reduced for better gradient updates
-            epochs=20
+            batch_size=2048,  # Increased for much faster training
+            epochs=30
         )
         console.print("="*60)
         
         if result:
             lstm_results = result
+            # Update tracker with client results for the report
+            if tracker:
+                # Since we trained one global model, we mark all clients as successful
+                # with the global metrics (or we could compute per-client if needed)
+                for client_id in trimmed_series.keys():
+                    tracker.client_results[client_id] = {
+                        'status': 'success', 
+                        'metrics': result.get('metrics', {})
+                    }
         else:
             lstm_results = None
         
@@ -423,7 +432,8 @@ def main():
         if lstm_results:
             console.print(f"   • Model Metrics - MAE: {lstm_results.get('metrics', {}).get('mae', 'N/A'):.2f} kW")
             console.print(f"   • Model Metrics - RMSE: {lstm_results.get('metrics', {}).get('rmse', 'N/A'):.2f} kW")
-            console.print(f"   • Model Metrics - MAPE: {lstm_results.get('metrics', {}).get('mape', 'N/A'):.2f}%")
+            console.print(f"   • Model Metrics - MAPE (Safe): {lstm_results.get('metrics', {}).get('mape', 'N/A'):.2f}%")
+            console.print(f"   • Model Metrics - WMAPE: {lstm_results.get('metrics', {}).get('wmape', 'N/A'):.2f}%")
         console.print(f"   • Errors: {summary.get('total_errors', 0)} (Recovered: {summary.get('recovered_errors', 0)})")
 
     except FileNotFoundError:
